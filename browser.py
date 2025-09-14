@@ -103,7 +103,9 @@ class BrowserPool:
 
 
 class BrowserWorker:
-    _browser: BrowserContext | None
+    _browser: Browser | None
+    _studio_browser: BrowserContext | None
+    _login_browser: BrowserContext | None
     _credential: Credential
     _endpoint: str | None
     _pool: BrowserPool
@@ -113,36 +115,37 @@ class BrowserWorker:
         self._loop = loop
         self._credential = credential
         self._browser = None
+        self._studio_browser = None
+        self._login_browser = None
         self._endpoint = endpoint
         self._pages = []
         self._pool = pool
 
     async def browser(self) -> BrowserContext:
-        if not self._browser:
-            if not self._endpoint:
-                _browser = typing.cast(Browser, await AsyncCamoufox(
+        if not self._studio_browser:
+            if not self._browser:
+                self._browser = typing.cast(Browser, await AsyncCamoufox(
                     headless=config.Headless,
                     main_world_eval=True,
                     enable_cache=True,
                     locale="US",
                 ).__aenter__())
-            else:
-                _browser = await (await async_playwright().__aenter__()).firefox.connect(self._endpoint)
-            if _browser.contexts:
-                context = _browser.contexts[0]
-            else:
-                storage_state = None
 
-                if self._credential.stateFile and os.path.exists(f'{config.StatesDir}/{self._credential.stateFile}'):
-                    storage_state = f'{config.StatesDir}/{self._credential.stateFile}'
-                context = await _browser.new_context(
-                    storage_state=storage_state,
-                    ignore_https_errors=True,
-                    locale="US",
-                )
-            self._browser = context
-            self._pages = list(context.pages)
-        return self._browser
+            storage_state = None
+            state_path = f'{config.StatesDir}/{self._credential.stateFile}'
+            if self._credential.stateFile and os.path.exists(state_path):
+                storage_state = state_path
+            else:
+                # This should not happen if validate_state is called first
+                raise Exception(f"State file not found for {self._credential.email}")
+
+            self._studio_browser = await self._browser.new_context(
+                storage_state=storage_state,
+                ignore_https_errors=True,
+                locale="US",
+            )
+            self._pages = list(self._studio_browser.pages)
+        return self._studio_browser
 
     async def handle_ListModels(self, route: Route) -> None:
         if not self._pool.get_Models():
@@ -163,18 +166,29 @@ class BrowserWorker:
             await page.evaluate("""()=>{mw:localStorage.setItem("aiStudioUserPreference", '{"isAdvancedOpen":false,"isSafetySettingsOpen":false,"areToolsOpen":true,"autosaveEnabled":false,"hasShownDrivePermissionDialog":true,"hasShownAutosaveOnDialog":true,"enterKeyBehavior":0,"theme":"system","bidiOutputFormat":3,"isSystemInstructionsOpen":true,"warmWelcomeDisplayed":true,"getCodeLanguage":"Python","getCodeHistoryToggle":true,"fileCopyrightAcknowledged":false,"enableSearchAsATool":true,"selectedSystemInstructionsConfigName":null,"thinkingBudgetsByModel":{},"rawModeEnabled":false,"monacoEditorTextWrap":false,"monacoEditorFontLigatures":true,"monacoEditorMinimap":false,"monacoEditorFolding":false,"monacoEditorLineNumbers":true,"monacoEditorStickyScrollEnabled":true,"monacoEditorGuidesIndentation":true}')}""")
 
     async def validate_state(self) -> bool:
-        async with self.page() as page:
-            logger.info('start validate state')
-            await page.goto(f'{config.AIStudioUrl}/prompts/new_chat')
-            if page.url.startswith(config.AIStudioUrl):
-                return True
-            elif not page.url.startswith('https://accounts.google.com/'):
-                raise BaseException(f"Page at unexcpected URL: {page.url}")
+        state_path = f'{config.StatesDir}/{self._credential.stateFile}'
+        # Check if state file is valid by trying to go to AI Studio
+        if os.path.exists(state_path):
+            async with self.page() as page:
+                await page.goto(f'{config.AIStudioUrl}/prompts/new_chat')
+                if page.url.startswith(config.AIStudioUrl):
+                    logger.info('State file is valid for %s', self._credential.email)
+                    return True
+                logger.info('State file is invalid for %s, re-login required.', self._credential.email)
 
-            # 没登录
-            if not self._credential.email or not self._credential.password:
-                return False
+        # No valid state file, perform login
+        if not self._credential.email or not self._credential.password:
+            raise Exception(f"No valid state file and no credentials to login for {self._credential.email}")
 
+        logger.info('Performing login for %s', self._credential.email)
+        p = await async_playwright().__aenter__()
+        browser = await p.firefox.launch(headless=config.Headless)
+        context = await browser.new_context(locale="US", ignore_https_errors=True)
+        page = await context.new_page()
+
+        try:
+            await page.goto('https://accounts.google.com/')
+            
             logger.info('login using credential %s', self._credential.email)
             await page.locator('input#identifierId').type(self._credential.email)
             await expect(page.locator('#identifierNext button')).to_be_enabled()
@@ -185,17 +199,21 @@ class BrowserWorker:
             await page.locator('input[name="Passwd"]').type(self._credential.password)
             await expect(page.locator('#passwordNext button')).to_be_enabled()
             await page.locator('#passwordNext button').click()
-            await page.wait_for_url(f'{config.AIStudioUrl}/prompts/new_chat')
-            if await page.locator('mat-dialog-content .welcome-option button[aria-label="Try Gemini"]').count() > 0:
-                await page.locator('mat-dialog-content .welcome-option button[aria-label="Try Gemini"]').click()
-            await (await self.browser()).storage_state(path=f'{config.StatesDir}/{self._credential.stateFile}')
-            logger.info('store stete for credential %s', self._credential.email)
+            
+            # Wait for successful login, e.g., by checking for a URL that indicates success
+            await page.wait_for_url("**/myaccount.google.com/**", timeout=60000)
+            
+            await context.storage_state(path=state_path)
+            logger.info('store state for credential %s', self._credential.email)
             return True
+        finally:
+            await browser.close()
+            await p.__aexit__()
 
     @contextlib.asynccontextmanager
     async def page(self):
         if not self._pages:
-            page = await (await self.browser()).new_page()
+            page = await (await self.browser()).new_page() # This now correctly uses the camouflaged browser
         else:
             page = self._pages.pop(0)
         await self.prepare_page(page)
