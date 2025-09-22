@@ -1,8 +1,10 @@
 from typing import AsyncGenerator
 import logging
-from fastapi import Depends, FastAPI, HTTPException, Query, Header, Response, Request, status
+import re
+from fastapi import Depends, FastAPI, HTTPException, Query, Header, Response, Request, status, UploadFile
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+import urllib.parse
 from models import genai
 from models.genai import (
     Content,
@@ -19,7 +21,7 @@ from contextlib import asynccontextmanager
 from fastapi.responses import StreamingResponse
 from browser import BrowserPool, InterceptTask
 from models import _adapter as adapter, aistudio, genai
-from config import config
+from config import config, AIOHTTP_PROXY, AIOHTTP_PROXY_AUTH
 from utils import TinyProfiler, Profiler, CredentialManager
 
 
@@ -66,13 +68,13 @@ async def api_key_auth(
 async def StreamGenerator(model_name: str, headers: dict[str, str], body: str, profiler: Profiler) -> AsyncGenerator[StreamEvent, None]:
     url = config.AIStudioAPIUrl
     timeout = aiohttp.ClientTimeout(total=config.AioHTTPTimeout, connect=None, sock_connect=None, sock_read=None)
-    async with aiohttp.ClientSession(timeout=timeout, connector=aiohttp.TCPConnector(ssl=False)) as session:
+    async with aiohttp.ClientSession(timeout=timeout, connector=aiohttp.TCPConnector(ssl=False if AIOHTTP_PROXY else True)) as session:
 
         profiler.span('aiohtpp: send request to aistudio', body)
-        print(url)
+
         resp = await session.post(
             url, headers=headers, data=body,
-            proxy=config.AIStudioProxy,
+            proxy=AIOHTTP_PROXY, proxy_auth=AIOHTTP_PROXY_AUTH,
         )
 
         chunks: list[bytes] = []
@@ -163,7 +165,7 @@ async def forward_request(request: Request) -> Response:
 
     timeout = aiohttp.ClientTimeout(total=config.AioHTTPTimeout, connect=None, sock_connect=None, sock_read=None)
     
-    session = aiohttp.ClientSession(timeout=timeout, connector=aiohttp.TCPConnector(ssl=False))
+    session = aiohttp.ClientSession(timeout=timeout, connector=aiohttp.TCPConnector(ssl=False if AIOHTTP_PROXY else True))
 
     try:
         method = request.method
@@ -172,7 +174,7 @@ async def forward_request(request: Request) -> Response:
             target_url,
             data=body,
             headers=headers,
-            proxy=config.AIStudioProxy
+            proxy=AIOHTTP_PROXY, proxy_auth=AIOHTTP_PROXY_AUTH
         )
     except aiohttp.ClientError as e:
         await session.close()
@@ -216,6 +218,9 @@ async def ListModel() -> genai.ListModelsResponse:
     aistudio_response = aistudio.ListModelsResponse(models=aistudio_models_list)
     
     return adapter.AIStudioListModelToGenAIListModel(aistudio_response)
+
+
+# TODO: 支持 Gemini API 文件上传接口
 
 
 @app.post("/upload/v1beta/files", response_model=genai.FileResponse, dependencies=[Depends(api_key_auth)])
@@ -265,6 +270,25 @@ async def upload_file_chunk(upload_id: str, request: Request):
         FILES[file_name].state = "ACTIVE"
         return genai.FileResponse(file=FILES[file_name])
     return Response(status_code=404)
+
+
+# 管理接口
+
+regex = re.compile(r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}\.json$')
+
+@app.post("/admin/upload_state", dependencies=[Depends(api_key_auth)])
+async def upload_state(state: UploadFile,  request: Request):
+    filename = urllib.parse.unquote(state.filename)
+    assert filename is not None
+    print(filename)
+    if not regex.match(filename):
+        return Response(status_code=400)
+    content = await state.read()
+    # TODO: validate state
+    logging.info('save state %s', filename)
+    with open(f'{config.StatesDir}/{filename}', 'wb') as f:
+        f.write(content)
+    return Response(status_code=200)
 
 
 if __name__ == "__main__":
